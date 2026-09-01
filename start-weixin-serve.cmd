@@ -1,8 +1,12 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-set "CODEX_REAL_BIN=C:\Users\cully\AppData\Roaming\npm\codex.cmd"
-set "CODEX_APP_SERVER_TRANSPORT=stdio"
-set "CODEXBRIDGE_DEFAULT_CWD=D:\cully\Documents"
-set "CODEXBRIDGE_LOCALE=zh-CN"
-npm run weixin:serve -- --cwd "D:\cully\Documents"
+title CodexBridge WeChat Service
+echo Starting CodexBridge WeChat service...
+echo Project: %CD%
+echo Close this window to stop the service.
+echo.
+npm run weixin:serve
+echo.
+echo CodexBridge WeChat service stopped.
+pause

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { finalizeTurnArtifacts } from '../../src/core/turn_artifacts.js';
+import { archiveTurnMediaArtifacts, finalizeTurnArtifacts } from '../../src/core/turn_artifacts.js';
 import type { TurnArtifactContext } from '../../src/types/core.js';
 
 test('finalizeTurnArtifacts rejects symlinked manifest files that escape the turn artifact directory', () => {
@@ -264,6 +264,67 @@ test('finalizeTurnArtifacts rejects oversized deliverables before they are copie
     assert.deepEqual(fs.readdirSync(spoolDir), []);
   } finally {
     restoreEnv('CODEXBRIDGE_MAX_ARTIFACT_SIZE_BYTES', previousLimit);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('archiveTurnMediaArtifacts stores all generated episode images in a named desktop project folder', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-media-archive-'));
+  const desktopDir = path.join(tempDir, 'Desktop');
+  const projectDir = path.join(desktopDir, '夜幕堡垒');
+  const artifactDir = path.join(tempDir, 'artifact-dir');
+  const spoolDir = path.join(tempDir, 'spool-dir');
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.mkdirSync(spoolDir, { recursive: true });
+  fs.writeFileSync(path.join(artifactDir, '镜头01.png'), 'image-1');
+  fs.writeFileSync(path.join(artifactDir, '镜头02.jpg'), 'image-2');
+
+  try {
+    const archived = archiveTurnMediaArtifacts({
+      result: { outputText: '', outputArtifacts: [] },
+      context: makeContext({ artifactDir, spoolDir }),
+      userText: '把桌面的夜幕堡垒这个文件夹第一集生成图片',
+      desktopDir,
+    });
+
+    assert.deepEqual(
+      archived.map((item) => path.basename(item.archivedPath)).sort(),
+      ['镜头01.png', '镜头02.jpg'],
+    );
+    assert.deepEqual(
+      fs.readdirSync(path.join(projectDir, '第一集图')).sort(),
+      ['镜头01.png', '镜头02.jpg'],
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('archiveTurnMediaArtifacts stores generated episode videos separately and does not duplicate retries', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-media-archive-'));
+  const desktopDir = path.join(tempDir, 'Desktop');
+  const projectDir = path.join(desktopDir, '夜幕堡垒');
+  const artifactDir = path.join(tempDir, 'artifact-dir');
+  const spoolDir = path.join(tempDir, 'spool-dir');
+  const videoPath = path.join(artifactDir, '成片.mp4');
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.mkdirSync(spoolDir, { recursive: true });
+  fs.writeFileSync(videoPath, 'video');
+
+  try {
+    const params = {
+      result: { outputText: '', outputArtifacts: [{ kind: 'video' as const, path: videoPath }] },
+      context: makeContext({ artifactDir, spoolDir }),
+      userText: '把桌面的夜幕堡垒文件夹第2集生成视频',
+      desktopDir,
+    };
+    archiveTurnMediaArtifacts(params);
+    archiveTurnMediaArtifacts(params);
+
+    assert.deepEqual(fs.readdirSync(path.join(projectDir, '第2集视频')), ['成片.mp4']);
+  } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

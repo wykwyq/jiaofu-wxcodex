@@ -244,9 +244,35 @@ test('WeixinBridgeRuntime sends a visible notice when Codex has not produced pro
   await runtime.runOnce();
 
   assert.deepEqual(sent, [
-    '已收到，Codex 正在生成回复。若长时间无响应，可发送 /stop 中断。',
+    '正在执行...',
     'done',
   ]);
+});
+
+test('WeixinBridgeRuntime keeps the visible processing notice when progress arrives before it', async () => {
+  const sent: string[] = [];
+  const runtime = makeRuntime({
+    processingNoticeDelayMs: 5,
+    previewSoftTargetBytes: 1024,
+    sendText: async ({ content }) => {
+      sent.push(content);
+    },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any = {}) {
+        await options.onProgress?.({
+          text: '正在分析',
+          delta: '正在分析',
+          outputKind: 'commentary',
+        });
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        return completeResponse('done');
+      },
+    },
+  });
+
+  await runtime.runOnce();
+
+  assert.deepEqual(sent, ['正在执行...', 'done']);
 });
 
 test('WeixinBridgeRuntime does not deadlock when the first final preview delta has no sentence boundary', async () => {

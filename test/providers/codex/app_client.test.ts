@@ -540,6 +540,43 @@ test('CodexAppClient startTurn sends explicit default collaboration settings pay
   assert.equal('personality' in turnStart, false);
 });
 
+test('CodexAppClient gives image and video generation turns enough time to finish', async () => {
+  const client = new CodexAppClient({
+    codexCliBin: 'codex',
+  });
+  const observedTimeouts: number[] = [];
+  client.request = async (method) => {
+    assert.equal(method, 'turn/start');
+    return { turn: { id: `turn-${observedTimeouts.length + 1}` } };
+  };
+  client.waitForTurnResult = async ({ timeoutMs }) => {
+    observedTimeouts.push(timeoutMs);
+    return {
+      outputText: 'done',
+      outputState: 'complete',
+      finalSource: 'thread_items',
+    };
+  };
+
+  await client.startTurn({
+    threadId: 'thread-1',
+    inputText: '把夜幕堡垒第一集生成一张图片',
+    timeoutMs: 90_000,
+  });
+  await client.startTurn({
+    threadId: 'thread-1',
+    inputText: '生成第一集视频',
+    timeoutMs: 90_000,
+  });
+  await client.startTurn({
+    threadId: 'thread-1',
+    inputText: '普通文本问题',
+    timeoutMs: 90_000,
+  });
+
+  assert.deepEqual(observedTimeouts, [600_000, 600_000, 90_000]);
+});
+
 test('CodexAppClient startTurn omits permission overrides when none are provided and forwards config overrides', async () => {
   const client = new CodexAppClient({
     codexCliBin: 'codex',
@@ -778,6 +815,35 @@ test('CodexAppClient startServer honors explicit websocket transport', async () 
   assert.equal(calls[0]?.args?.[0], 'app-server');
   assert.deepEqual(calls[0]?.args?.slice(1, 2), ['--listen']);
   assert.match(String(calls[0]?.args?.[2]), /^ws:\/\/127\.0\.0\.1:\d+$/);
+});
+
+test('CodexAppClient forces UTF-8 Python output for Windows app-server tools', async () => {
+  const calls = [];
+  const child = new EventEmitter() as EventEmitter & {
+    stderr: EventEmitter;
+    exitCode: number | null;
+  };
+  child.stderr = new EventEmitter();
+  child.exitCode = null;
+
+  const client = new CodexAppClient({
+    codexCliBin: 'codex.exe',
+    platform: 'win32',
+    spawnImpl: ((command, args, options) => {
+      calls.push({ command, args, options });
+      return child as any;
+    }) as any,
+  });
+
+  client.connectWebSocket = async () => {
+    client.connected = true;
+  };
+  client.initialize = async () => {};
+
+  await client.startServer();
+
+  assert.equal(calls[0]?.options?.env?.PYTHONUTF8, '1');
+  assert.equal(calls[0]?.options?.env?.PYTHONIOENCODING, 'utf-8');
 });
 
 test('CodexAppClient startServer falls back to websocket when stdio auto-start fails', async () => {

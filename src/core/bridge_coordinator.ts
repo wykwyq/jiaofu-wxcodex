@@ -26,6 +26,7 @@ import {
 import { runAgentJobWithMissionControl } from './mission_control_agent_job_runner.js';
 import { computeNextRunAt as computeAutomationNextRunAt } from './automation_job_service.js';
 import {
+  archiveTurnMediaArtifacts,
   createPendingTurnArtifactDeliveryState,
   createTurnArtifactContext,
   ensureTurnArtifactDirectories,
@@ -11588,6 +11589,26 @@ export class BridgeCoordinator {
       result,
       context: turnArtifactContext,
     });
+    try {
+      const archivedMedia = archiveTurnMediaArtifacts({
+        result: finalizedResult,
+        context: turnArtifactContext,
+        userText: event.text,
+      });
+      if (archivedMedia.length > 0) {
+        debugCoordinator('turn_media_archived', {
+          platform: scopeRef.platform,
+          scopeId: scopeRef.externalScopeId,
+          files: archivedMedia,
+        });
+      }
+    } catch (error) {
+      debugCoordinator('turn_media_archive_failed', {
+        platform: scopeRef.platform,
+        scopeId: scopeRef.externalScopeId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
     if (shouldRecoverFromProviderTurnResult(finalizedResult)) {
       const errorMessage = finalizedResult.errorMessage || 'Codex turn failed with a recoverable provider error';
       debugCoordinator('turn_result_recoverable_provider_error', {
@@ -20698,7 +20719,10 @@ function isInvalidWorkspaceSelectedError(error) {
 }
 
 function shouldAutoRebindAfterRecoveryFailure(error) {
-  return isStaleThreadError(error) || isResumeRetryableError(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return isStaleThreadError(error)
+    || isResumeRetryableError(error)
+    || /thread-store conflict|already has an active writer/i.test(message);
 }
 
 function shouldRecoverFromProviderTurnResult(result) {

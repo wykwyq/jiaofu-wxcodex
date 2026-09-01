@@ -98,6 +98,9 @@ async function main(argv: string[] = process.argv.slice(2)) {
   if (group === 'weixin' && command === 'clear-context') {
     return runWeixinClearContext(args);
   }
+  if (group === 'weixin' && command === 'logout') {
+    return runWeixinLogout(args);
+  }
   if (group === 'codex' && command === 'cleanup-internal-threads') {
     return runCodexCleanupInternalThreads(args);
   }
@@ -115,6 +118,7 @@ async function runWeixinLogin(args: string[]) {
   const accountsDir = path.join(stateDir, 'weixin', 'accounts');
   const accountStore = new WeixinAccountStore({ rootDir: accountsDir });
   let qrFilePath: string | null = null;
+  let qrOpened = false;
 
   const credentials = await officialQrLogin({
     accountStore,
@@ -128,6 +132,10 @@ async function runWeixinLogin(args: string[]) {
         qrcodeImageContent,
       });
       qrFilePath = output.filePath ?? null;
+      if (!qrOpened && (output.filePath || output.sourceUrl)) {
+        qrOpened = true;
+        await openQrArtifact(output.filePath ?? output.sourceUrl!);
+      }
       process.stdout.write(`${i18n.t('cli.login.qrGenerated')}\n`);
       process.stdout.write(`qrcode: ${qrcode}\n`);
       if (output.filePath) {
@@ -193,6 +201,42 @@ async function runWeixinClearContext(args: string[]) {
 
   clearContextTokensForAccount(accountsDir, accountId);
   process.stdout.write(`${i18n.t('cli.clearContext.success')}\n`);
+  process.stdout.write(`${i18n.t('cli.clearContext.account', { value: accountId })}\n`);
+}
+
+async function runWeixinLogout(args: string[]) {
+  const i18n = createI18n();
+  const options = parseWeixinClearContextArgs(args);
+  const stateDir = path.resolve(options.stateDir ?? defaultCodexBridgeStateDir());
+  const accountsDir = path.join(stateDir, 'weixin', 'accounts');
+  const accountStore = new WeixinAccountStore({ rootDir: accountsDir });
+  const allAccounts = accountStore.listAccounts();
+
+  if (allAccounts.length === 0) {
+    process.stderr.write(`${i18n.t('cli.clearContext.noAccounts')}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const accountId = resolveClearContextAccountId({
+    requestedAccountId: options.accountId,
+    allAccounts,
+  });
+  if (!accountId) {
+    process.stderr.write(`${i18n.t('cli.clearContext.accountRequired')}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!allAccounts.includes(accountId)) {
+    process.stderr.write(`${i18n.t('cli.clearContext.accountNotFound', { accountId })}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  clearContextTokensForAccount(accountsDir, accountId);
+  await unlinkIfExists(accountStore.accountFile(accountId));
+  await unlinkIfExists(accountStore.syncFile(accountId));
+  process.stdout.write(`${i18n.t('cli.logout.success')}\n`);
   process.stdout.write(`${i18n.t('cli.clearContext.account', { value: accountId })}\n`);
 }
 
@@ -688,6 +732,35 @@ async function materializeQrArtifact({ stateDir, qrcode, qrcodeImageContent }: {
   return { filePath: null, sourceUrl: null };
 }
 
+async function openQrArtifact(target: string) {
+  try {
+    if (process.platform === 'win32') {
+      const child = spawn('cmd.exe', ['/d', '/c', 'start', '', target], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+      return;
+    }
+    const command = process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const child = spawn(command, [target], { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch {
+    // The QR path is still printed, so login remains usable if auto-open fails.
+  }
+}
+
+async function unlinkIfExists(filePath: string) {
+  try {
+    await fsp.unlink(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
+  }
+}
+
 function mimeToExtension(contentType: string) {
   const value = String(contentType).toLowerCase();
   if (value.includes('svg')) {
@@ -948,6 +1021,7 @@ function printUsage() {
     createI18n().t('cli.usage.title'),
     createI18n().t('cli.usage.login'),
     createI18n().t('cli.usage.clearContext'),
+    createI18n().t('cli.usage.logout'),
     createI18n().t('cli.usage.serve'),
     createI18n().t('cli.usage.cleanupInternalThreads'),
     createI18n().t('cli.usage.nativeApiServe'),

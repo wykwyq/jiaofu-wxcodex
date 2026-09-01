@@ -36,6 +36,7 @@ import type {
 
 const APP_SERVER_CONNECT_TIMEOUT_MS = 20_000;
 const DEFAULT_TURN_TIMEOUT_MS = 5 * 60 * 1000;
+const MEDIA_GENERATION_TURN_TIMEOUT_MS = 10 * 60 * 1000;
 
 interface CodexAppLogger {
   debug?: (message: string) => void;
@@ -732,6 +733,7 @@ export class CodexAppClient extends EventEmitter {
     onApprovalRequest?: ((request: ProviderApprovalRequest) => Promise<void> | void) | null;
     timeoutMs?: number;
   }): Promise<ProviderTurnResult> {
+    const effectiveTimeoutMs = resolveEffectiveTurnTimeoutMs(inputText, timeoutMs);
     this.logDebug('turn_start_requested', {
       threadId,
       cwd,
@@ -742,7 +744,7 @@ export class CodexAppClient extends EventEmitter {
       approvalPolicy,
       sandboxMode,
       collaborationMode,
-      timeoutMs,
+      timeoutMs: effectiveTimeoutMs,
       inputCount: Array.isArray(input) ? input.length : 1,
       inputSummary: summarizeTurnInput(
         Array.isArray(input) && input.length > 0
@@ -823,7 +825,7 @@ export class CodexAppClient extends EventEmitter {
       turnId: String(turn.id),
       onProgress,
       onApprovalRequest,
-      timeoutMs,
+      timeoutMs: effectiveTimeoutMs,
     });
   }
 
@@ -1201,15 +1203,24 @@ export class CodexAppClient extends EventEmitter {
       args: appServerArgs,
       platform: this.platform,
     });
+    const childEnvironment = this.platform === 'win32'
+      ? {
+        ...process.env,
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8',
+      }
+      : process.env;
     try {
       this.child = launchSpec.args
         ? this.spawnImpl(launchSpec.command, launchSpec.args, {
           stdio: transportKind === 'stdio' ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
           ...launchSpec.options,
+          env: childEnvironment,
         })
         : this.spawnImpl(launchSpec.command, {
           stdio: transportKind === 'stdio' ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
           ...launchSpec.options,
+          env: childEnvironment,
         });
     } catch (error) {
       throw createCodexLaunchError({
@@ -1732,6 +1743,7 @@ export class CodexAppClient extends EventEmitter {
     let includeTurnsUnsupported = this.transportKind === 'stdio';
     let includeTurnsUnsupportedAt = includeTurnsUnsupported ? this.turnPollNow() : 0;
     let threadSummaryForFallback: ProviderThreadSummary | null = null;
+    let resolvedSessionPath: string | null = null;
     let pendingApprovalWaitLogged = false;
     let lastPendingApprovalCount = 0;
     const terminalSettleMs = computeTerminalSettleMs(timeoutMs);
@@ -1901,13 +1913,17 @@ export class CodexAppClient extends EventEmitter {
         const turn = includeTurnsUnsupported
           ? null
           : thread?.turns?.find((entry) => entry.id === turnId) ?? null;
+        const sessionPath = thread?.path
+          ?? resolvedSessionPath
+          ?? findCodexSessionPath(threadId);
+        resolvedSessionPath ||= sessionPath;
         this.logDebug('turn_poll_snapshot', {
           threadId,
           turnId,
           pollCount,
           elapsedMs: timeoutMs - Math.max(0, deadline - this.turnPollNow()),
           threadFound: Boolean(thread),
-          threadPath: thread?.path ?? null,
+          threadPath: sessionPath,
           turn: summarizeTurnSnapshot(turn),
           progress: summarizeProgressState(progressState),
         });
@@ -1927,6 +1943,27 @@ export class CodexAppClient extends EventEmitter {
           };
           this.logDebug('turn_wait_return', summarizeTurnResultForDebug(result));
           return result;
+        }
+        if (!turn || !isTurnTerminal(turn.status)) {
+          const sessionState = inspectTurnCompletionFromSessionPath(sessionPath, turnId);
+          if (sessionState.hasTaskComplete && (sessionState.lastAgentMessage || sessionState.outputArtifacts.length > 0)) {
+            this.noteApprovedExecutionSignal({
+              threadId,
+              turnId,
+              signalKind: 'session_task_complete',
+              markCompleted: true,
+            });
+            const result = buildSessionTaskCompleteResult({
+              turnId,
+              threadId,
+              title: thread?.title ?? null,
+              status: turn?.status ?? 'completed',
+              previewText: progressState.finalAnswerText,
+              sessionState,
+            });
+            this.logDebug('turn_wait_return', summarizeTurnResultForDebug(result));
+            return result;
+          }
         }
         if (includeTurnsUnsupported) {
           const previewText = progressState.finalAnswerText || progressState.commentaryText;
@@ -2053,7 +2090,7 @@ export class CodexAppClient extends EventEmitter {
             this.logDebug('turn_wait_return', summarizeTurnResultForDebug(result));
             return result;
           }
-          const sessionState = inspectTurnCompletionFromSessionPath(thread?.path ?? null, turnId);
+          const sessionState = inspectTurnCompletionFromSessionPath(sessionPath, turnId);
           const hasAssistantVisibleItems = turn.items.some((item) => isAssistantVisibleItem(item));
           const completionState = classifyTurnCompletionState(turn);
           this.logDebug('turn_terminal_state', {
@@ -2213,7 +2250,7 @@ export class CodexAppClient extends EventEmitter {
                 turnId,
                 pollCount,
                 reason: 'waiting_for_session_task_complete',
-                sessionPath: thread?.path ?? null,
+                sessionPath,
               });
               await this.turnPollSleep(1000);
               continue;
@@ -3644,6 +3681,14 @@ function resolveTurnTimeoutMs(value: unknown): number {
     : DEFAULT_TURN_TIMEOUT_MS;
 }
 
+function resolveEffectiveTurnTimeoutMs(inputText: string, timeoutMs: number): number {
+  const text = String(inputText ?? '');
+  const requestsMediaGeneration = /(?:生成|制作|创建|绘制|画|做).{0,16}(?:图片|图像|生图|视频|动画)|(?:图片|图像|生图|视频|动画).{0,16}(?:生成|制作|创建|绘制)/iu.test(text);
+  return requestsMediaGeneration
+    ? Math.max(timeoutMs, MEDIA_GENERATION_TURN_TIMEOUT_MS)
+    : timeoutMs;
+}
+
 function computeApprovedExecutionIdleLimitMs(timeoutMs) {
   const numericTimeout = Number(timeoutMs || 0);
   if (!Number.isFinite(numericTimeout) || numericTimeout <= 0) {
@@ -3904,6 +3949,27 @@ function materializeInlineImage(savedPath, buffer) {
   } catch {
     return null;
   }
+}
+
+function findCodexSessionPath(threadId: string): string | null {
+  const codexHome = String(process.env.CODEX_HOME ?? '').trim() || path.join(os.homedir(), '.codex');
+  const sessionsDir = path.join(codexHome, 'sessions');
+  if (!fs.existsSync(sessionsDir)) {
+    return null;
+  }
+  try {
+    const entries = fs.readdirSync(sessionsDir, { recursive: true, withFileTypes: true });
+    const suffix = `${threadId}.jsonl`;
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(suffix)) {
+        continue;
+      }
+      return path.join(entry.parentPath, entry.name);
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 function inspectTurnCompletionFromSessionPath(sessionPath, turnId) {

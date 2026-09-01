@@ -223,7 +223,7 @@ export class WeixinBridgeRuntime {
     previewHardLimitBytes = 2048,
     previewIntervalMs = 3000,
     typingKeepaliveMs = WeixinBridgeRuntime.DEFAULT_TYPING_KEEPALIVE_MS,
-    processingNoticeDelayMs = 12_000,
+    processingNoticeDelayMs = 3_000,
     inboundAttachmentMergeWindowMs = 3000,
     automationPollMs = 30_000,
     internalThreadCleanupMs = 24 * 60 * 60 * 1000,
@@ -554,11 +554,6 @@ export class WeixinBridgeRuntime {
     try {
       const response = await this.bridgeCoordinator.handleInboundEvent(event, {
         onProgress: async (progress) => {
-          responseSettled = true;
-          if (processingNoticeTimer) {
-            clearTimeout(processingNoticeTimer);
-            processingNoticeTimer = null;
-          }
           if (options.suppressProgressDelivery) {
             return;
           }

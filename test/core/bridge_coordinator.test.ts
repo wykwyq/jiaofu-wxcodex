@@ -1560,6 +1560,33 @@ test('bridge coordinator auto-rebinds to a new session when stale thread resume 
   );
 });
 
+test('bridge coordinator auto-rebinds when Codex reports an active thread writer conflict', async () => {
+  const { runtime, openai } = makeRuntime();
+  const original = await runtime.services.bridgeCoordinator.handleInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wx-user-active-writer',
+    text: 'hello codexbridge',
+  });
+  openai.threads.delete(original.session.codexThreadId);
+  openai.resumeThread = async ({ threadId }) => {
+    openai.resumeThreadCalls.push({ threadId });
+    throw new Error(`thread-store conflict: thread ${threadId} already has an active writer`);
+  };
+
+  const result = await runtime.services.bridgeCoordinator.handleInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wx-user-active-writer',
+    text: 'hello again',
+  });
+
+  assert.match(result.messages[0]?.text ?? '', /openai: hello again/);
+  const rebound = runtime.services.bridgeSessions.resolveScopeSession({
+    platform: 'weixin',
+    externalScopeId: 'wx-user-active-writer',
+  });
+  assert.notEqual(rebound?.codexThreadId, original.session.codexThreadId);
+});
+
 test('bridge coordinator auto-rebinds when Codex returns a stale-thread provider_error result', async () => {
   const { runtime, openai } = makeRuntime();
   const original = await runtime.services.bridgeCoordinator.handleInboundEvent({

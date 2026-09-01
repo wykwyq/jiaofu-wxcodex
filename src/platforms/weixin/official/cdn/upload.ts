@@ -148,10 +148,10 @@ async function uploadMediaToCdn(params: {
   });
 
   try {
-    const thumb = thumbSource
+    const thumb = thumbSource && uploadUrlResp.thumb_upload_param
       ? await uploadThumbToCdn({
         thumbSource,
-        uploadParam: uploadUrlResp.thumb_upload_param ?? undefined,
+        uploadParam: uploadUrlResp.thumb_upload_param,
         filekey,
         cdnBaseUrl: params.cdnBaseUrl,
         aeskey,
@@ -159,6 +159,14 @@ async function uploadMediaToCdn(params: {
         fetchImpl: params.opts.fetchImpl as typeof globalThis.fetch | undefined,
       })
       : null;
+    if (thumbSource && !uploadUrlResp.thumb_upload_param) {
+      debugWeixinUpload('upload_thumb_skipped', {
+        label: params.label,
+        filePath: params.filePath,
+        filekey,
+        reason: 'thumb_upload_param_missing',
+      });
+    }
 
     const result = {
       filekey,

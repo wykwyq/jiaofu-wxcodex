@@ -49,6 +49,12 @@ interface ArtifactPolicyResult extends MaterializedArtifactResult {
   countRejectedCount: number;
 }
 
+export interface ArchivedTurnMedia {
+  kind: 'image' | 'video';
+  sourcePath: string;
+  archivedPath: string;
+}
+
 export function createTurnArtifactContext({
   bridgeSessionId,
   cwd,
@@ -231,6 +237,40 @@ export function finalizeTurnArtifacts({
     outputMedia: normalizeImageMedia(limitedArtifacts.artifacts),
     artifactDelivery,
   };
+}
+
+export function archiveTurnMediaArtifacts({
+  result,
+  context,
+  userText,
+  desktopDir = path.join(os.homedir(), 'Desktop'),
+}: {
+  result: ProviderTurnResult;
+  context: TurnArtifactContext;
+  userText: string;
+  desktopDir?: string;
+}): ArchivedTurnMedia[] {
+  const projectDir = resolveRequestedMediaProjectDir(userText, desktopDir);
+  if (!projectDir) {
+    return [];
+  }
+  const episodeLabel = resolveEpisodeLabel(userText);
+  const candidates = collectMediaArchiveCandidates(result, context);
+  const archived: ArchivedTurnMedia[] = [];
+  for (const candidate of candidates) {
+    const folderName = candidate.kind === 'image'
+      ? episodeLabel ? `${episodeLabel}图` : '图片'
+      : episodeLabel ? `${episodeLabel}视频` : '视频';
+    const targetDir = path.join(projectDir, folderName);
+    fs.mkdirSync(targetDir, { recursive: true });
+    const archivedPath = copyMediaToArchive(candidate.path, targetDir);
+    archived.push({
+      kind: candidate.kind,
+      sourcePath: candidate.path,
+      archivedPath,
+    });
+  }
+  return archived;
 }
 
 function normalizeProviderArtifacts(result: ProviderTurnResult): OutputArtifact[] {
@@ -651,6 +691,107 @@ function listRegularFiles(rootDir: string): string[] {
     }
   }
   return results;
+}
+
+function resolveRequestedMediaProjectDir(userText: string, desktopDir: string): string | null {
+  const text = String(userText ?? '').trim();
+  if (!text) {
+    return null;
+  }
+  const quotedDirectories = [...text.matchAll(/[“"'‘]([^”"'’]+)[”"'’]/gu)]
+    .map((match) => String(match[1] ?? '').trim())
+    .filter(Boolean);
+  for (const candidate of quotedDirectories) {
+    if (isDirectory(candidate)) {
+      return path.resolve(candidate);
+    }
+  }
+  if (!/桌面/u.test(text) || !isDirectory(desktopDir)) {
+    return null;
+  }
+  const matchingDesktopDirectories = fs.readdirSync(desktopDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && text.includes(entry.name))
+    .sort((left, right) => right.name.length - left.name.length);
+  const matched = matchingDesktopDirectories[0];
+  return matched ? path.join(desktopDir, matched.name) : null;
+}
+
+function resolveEpisodeLabel(userText: string): string | null {
+  const match = String(userText ?? '').match(/第\s*([0-9一二三四五六七八九十百零两]+)\s*集/u);
+  const episode = String(match?.[1] ?? '').trim();
+  return episode ? `第${episode}集` : null;
+}
+
+function collectMediaArchiveCandidates(
+  result: ProviderTurnResult,
+  context: TurnArtifactContext,
+): Array<{ kind: 'image' | 'video'; path: string }> {
+  const paths = [
+    ...listRegularFiles(context.artifactDir),
+    ...(Array.isArray(result.outputArtifacts)
+      ? result.outputArtifacts.map((artifact) => String(artifact?.path ?? '').trim())
+      : []),
+  ];
+  const candidates: Array<{ kind: 'image' | 'video'; path: string }> = [];
+  const seenNames = new Set<string>();
+  for (const candidatePath of paths) {
+    if (!candidatePath || !isRegularFile(candidatePath)) {
+      continue;
+    }
+    const kind = resolveMediaArchiveKind(candidatePath);
+    const nameKey = path.basename(candidatePath).toLowerCase();
+    if (!kind || seenNames.has(nameKey)) {
+      continue;
+    }
+    seenNames.add(nameKey);
+    candidates.push({ kind, path: path.resolve(candidatePath) });
+  }
+  return candidates;
+}
+
+function resolveMediaArchiveKind(filePath: string): 'image' | 'video' | null {
+  const extension = path.extname(filePath).toLowerCase();
+  if (['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.avif'].includes(extension)) {
+    return 'image';
+  }
+  if (['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mpeg', '.mpg'].includes(extension)) {
+    return 'video';
+  }
+  return null;
+}
+
+function copyMediaToArchive(sourcePath: string, targetDir: string): string {
+  const fileName = sanitizeArtifactName(path.basename(sourcePath));
+  const initialTarget = path.join(targetDir, fileName);
+  if (path.resolve(sourcePath) === path.resolve(initialTarget)) {
+    return initialTarget;
+  }
+  if (fs.existsSync(initialTarget)) {
+    const sourceSize = fs.statSync(sourcePath).size;
+    const targetSize = fs.statSync(initialTarget).size;
+    if (sourceSize === targetSize) {
+      return initialTarget;
+    }
+  }
+  const targetPath = reserveSpoolPath(targetDir, fileName);
+  fs.copyFileSync(sourcePath, targetPath);
+  return targetPath;
+}
+
+function isDirectory(candidatePath: string): boolean {
+  try {
+    return fs.statSync(candidatePath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isRegularFile(candidatePath: string): boolean {
+  try {
+    return fs.statSync(candidatePath).isFile();
+  } catch {
+    return false;
+  }
 }
 
 function copyArtifactToSpool(sourcePath: string, spoolDir: string, displayName: string): string {

@@ -928,6 +928,7 @@ test('WeixinOfficialTransport.sendMediaFile uploads video media with thumbnail m
 
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; method: string; body?: string | Uint8Array | null }> = [];
+  let includeThumbUploadParam = true;
 
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
@@ -944,7 +945,7 @@ test('WeixinOfficialTransport.sendMediaFile uploads video media with thumbnail m
     if (url.includes('/ilink/bot/getuploadurl')) {
       return new Response(JSON.stringify({
         upload_param: 'upload-param',
-        thumb_upload_param: 'thumb-upload-param',
+        ...(includeThumbUploadParam ? { thumb_upload_param: 'thumb-upload-param' } : {}),
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -1016,6 +1017,25 @@ test('WeixinOfficialTransport.sendMediaFile uploads video media with thumbnail m
     assert.ok(typeof mediaPayload.msg.item_list?.[0]?.video_item?.video_md5 === 'string');
     assert.equal(captionPayload.msg.item_list?.[0]?.type, 1);
     assert.equal(captionPayload.msg.item_list?.[0]?.text_item?.text, '视频说明');
+
+    requests.length = 0;
+    includeThumbUploadParam = false;
+    const fallbackResult = await transport.sendMediaFile({
+      filePath: videoPath,
+      toUserId: 'wxid_sender',
+      text: '',
+      contextToken: 'ctx-1',
+      cdnBaseUrl: 'https://novac2c.cdn.weixin.qq.com/c2c',
+    });
+
+    assert.ok(fallbackResult.messageId);
+    assert.equal(requests.filter((entry) => entry.url.includes('/upload?')).length, 1);
+    const fallbackSendCall = requests.find((entry) => entry.url.includes('/ilink/bot/sendmessage'));
+    assert.ok(fallbackSendCall);
+    const fallbackPayload = JSON.parse(String(fallbackSendCall?.body ?? '{}'));
+    assert.equal(fallbackPayload.msg.item_list?.[0]?.type, 5);
+    assert.equal(fallbackPayload.msg.item_list?.[0]?.video_item?.thumb_media, undefined);
+    assert.equal(fallbackPayload.msg.item_list?.[0]?.video_item?.thumb_size, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }
