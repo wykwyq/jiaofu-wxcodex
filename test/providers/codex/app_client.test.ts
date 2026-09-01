@@ -109,7 +109,32 @@ test('CodexAppClient forwards thread title and ephemeral start requests', async 
 
   assert.equal(seenParams.title, 'Assistant Record Command Skill');
   assert.equal(seenParams.ephemeral, true);
+  assert.equal(seenParams.persistExtendedHistory, false);
   assert.equal(started.threadId, 'thread-1');
+});
+
+test('CodexAppClient persists normal threads in extended history', async () => {
+  const client = new CodexAppClient({
+    codexCliBin: 'codex',
+  });
+  let seenParams: any = null;
+
+  client.request = async (method, params) => {
+    assert.equal(method, 'thread/start');
+    seenParams = params;
+    return {
+      thread: { id: 'thread-1', name: 'Persistent' },
+      cwd: '/tmp/work',
+    };
+  };
+
+  await client.startThread({
+    cwd: '/tmp/work',
+    title: 'Persistent thread',
+  });
+
+  assert.equal(seenParams.ephemeral, null);
+  assert.equal(seenParams.persistExtendedHistory, true);
 });
 
 test('CodexAppClient normalizes second-based thread timestamps to milliseconds', async () => {

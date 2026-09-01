@@ -555,7 +555,7 @@ export class CodexAppClient extends EventEmitter {
       personality: null,
       ephemeral,
       experimentalRawEvents: true,
-      persistExtendedHistory: false,
+      persistExtendedHistory: ephemeral !== true,
     };
     if (typeof approvalPolicy === 'string' && approvalPolicy.trim()) {
       requestPayload.approvalPolicy = approvalPolicy;
@@ -587,7 +587,7 @@ export class CodexAppClient extends EventEmitter {
       modelProvider: null,
       personality: null,
       experimentalRawEvents: true,
-      persistExtendedHistory: false,
+      persistExtendedHistory: true,
     }, { timeoutMs: 30_000 });
   }
 
