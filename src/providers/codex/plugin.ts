@@ -10,6 +10,7 @@ import { CodexCliReviewRunner } from './review_runner.js';
 import { buildCodexPermissionRuntimeOverrides } from '../../core/permissions_mode.js';
 import { resolveReasoningEffortForProvider } from '../shared/thinking_policy.js';
 import { buildTurnArtifactDeveloperInstructions } from '../../core/turn_artifacts.js';
+import { buildNatiemanjuRoutingInstructions } from '../../core/natiemanju_router.js';
 import type {
   BridgeSession,
   DeveloperPromptContext,
@@ -953,6 +954,10 @@ function buildDeveloperInstructions(event: InboundTextEvent): string {
   const explicitPluginInstructions = buildExplicitPluginDeveloperInstructions(resolveExplicitPluginTargets(event));
   if (explicitPluginInstructions) {
     parts.push(explicitPluginInstructions);
+  }
+  const natiemanjuInstructions = buildNatiemanjuRoutingInstructions(event.text);
+  if (natiemanjuInstructions) {
+    parts.push(natiemanjuInstructions);
   }
   return parts.filter(Boolean).join('\n\n');
 }
