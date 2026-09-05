@@ -43,8 +43,13 @@ export function loadWeixinConfig({
   let accountId = normalizeString(env.WEIXIN_ACCOUNT_ID);
   if (!accountId) {
     const accountIds = accountStore.listAccounts();
-    if (accountIds.length === 1) {
-      [accountId] = accountIds;
+    if (accountIds.length > 0) {
+      accountId = accountIds
+        .map((candidate) => ({
+          candidate,
+          savedAt: accountStore.loadAccount(candidate)?.saved_at ?? '',
+        }))
+        .sort((left, right) => right.savedAt.localeCompare(left.savedAt))[0]?.candidate ?? null;
     }
   }
 

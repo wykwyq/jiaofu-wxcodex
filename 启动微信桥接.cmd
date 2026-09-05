@@ -1,28 +1,37 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title CodexBridge 微信桥接服务
-echo 正在启动 CodexBridge 微信桥接服务...
-echo 项目目录：%CD%
-echo 关闭此窗口将停止服务。
+title CodexBridge Weixin Bridge
+echo Starting CodexBridge Weixin bridge...
+echo Project directory: %CD%
+echo Close this window to stop the foreground service.
 echo.
+
+if not defined CODEX_REAL_BIN for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\resolve-codex-bin.ps1"`) do if not defined CODEX_REAL_BIN set "CODEX_REAL_BIN=%%I"
+if not defined CODEX_REAL_BIN (
+  echo Codex CLI was not found on PATH.
+  echo Install Codex CLI or set CODEX_REAL_BIN to the full path of codex.exe or codex.cmd.
+  pause
+  exit /b 1
+)
+echo Codex CLI: %CODEX_REAL_BIN%
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$dir = Join-Path $env:USERPROFILE '.codexbridge\weixin\accounts'; $accounts = @(Get-ChildItem -LiteralPath $dir -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '\.(context-tokens|sync)\.json$' }); if ($accounts.Count -eq 0) { exit 1 }"
 if errorlevel 1 (
-  echo 未检测到微信登录状态，正在打开二维码登录...
+  echo No saved Weixin account found. Starting QR login...
   echo.
   call npm run weixin:login -- --timeout-sec 480
   if errorlevel 1 (
     echo.
-    echo 微信扫码登录失败或超时，服务未启动。
+    echo Weixin QR login failed or timed out.
     pause
     exit /b 1
   )
   echo.
-  echo 登录成功，正在启动微信桥接服务...
+  echo Login completed.
 )
 
-call npm run weixin:serve
+call npm run weixin:serve -- --cwd "%CD%"
 echo.
-echo CodexBridge 微信桥接服务已停止。
+echo CodexBridge Weixin bridge stopped.
 pause

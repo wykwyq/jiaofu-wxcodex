@@ -35,6 +35,7 @@
     "weixin:login": "tsx src/cli.ts weixin login",
     "weixin:clear-context": "tsx src/cli.ts weixin clear-context",
     "weixin:logout": "tsx src/cli.ts weixin logout",
+    "weixin:clear-accounts": "tsx src/cli.ts weixin clear-accounts",
     "weixin:serve": "tsx src/cli.ts weixin serve",
     "codex:cleanup-internal-threads": "tsx src/cli.ts codex cleanup-internal-threads",
     "test": "node ./scripts/test.mjs",

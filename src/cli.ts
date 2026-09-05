@@ -101,6 +101,9 @@ async function main(argv: string[] = process.argv.slice(2)) {
   if (group === 'weixin' && command === 'logout') {
     return runWeixinLogout(args);
   }
+  if (group === 'weixin' && command === 'clear-accounts') {
+    return runWeixinClearAccounts(args);
+  }
   if (group === 'codex' && command === 'cleanup-internal-threads') {
     return runCodexCleanupInternalThreads(args);
   }
@@ -238,6 +241,23 @@ async function runWeixinLogout(args: string[]) {
   await unlinkIfExists(accountStore.syncFile(accountId));
   process.stdout.write(`${i18n.t('cli.logout.success')}\n`);
   process.stdout.write(`${i18n.t('cli.clearContext.account', { value: accountId })}\n`);
+}
+
+async function runWeixinClearAccounts(args: string[]) {
+  const i18n = createI18n();
+  const options = parseWeixinClearContextArgs(args);
+  const stateDir = path.resolve(options.stateDir ?? defaultCodexBridgeStateDir());
+  const accountsDir = path.join(stateDir, 'weixin', 'accounts');
+  const accountStore = new WeixinAccountStore({ rootDir: accountsDir });
+  const allAccounts = accountStore.listAccounts();
+
+  for (const accountId of allAccounts) {
+    clearContextTokensForAccount(accountsDir, accountId);
+    await unlinkIfExists(accountStore.accountFile(accountId));
+    await unlinkIfExists(accountStore.syncFile(accountId));
+  }
+
+  process.stdout.write(`${i18n.t('cli.clearAccounts.success', { count: allAccounts.length })}\n`);
 }
 
 async function runWeixinServe(args: string[]) {
@@ -1022,6 +1042,7 @@ function printUsage() {
     createI18n().t('cli.usage.login'),
     createI18n().t('cli.usage.clearContext'),
     createI18n().t('cli.usage.logout'),
+    createI18n().t('cli.usage.clearAccounts'),
     createI18n().t('cli.usage.serve'),
     createI18n().t('cli.usage.cleanupInternalThreads'),
     createI18n().t('cli.usage.nativeApiServe'),
