@@ -2306,6 +2306,49 @@ test('completed provider results release the local active turn even when thread 
   assert.equal(runtime.services.activeTurns.resolveScopeTurn(scopeRef), null);
 });
 
+test('timed-out partial provider results release the local active turn after interruption', async () => {
+  const { runtime, openai } = makeRuntime();
+  const originalStartTurn = openai.startTurn.bind(openai);
+  const scopeRef = {
+    platform: 'weixin',
+    externalScopeId: 'wx-user-timeout-local-release-1',
+  };
+
+  openai.startTurn = async ({ bridgeSession, inputText, onTurnStarted = null }) => {
+    if (inputText !== 'partial after timeout') {
+      return originalStartTurn({ bridgeSession, inputText, onTurnStarted });
+    }
+    const thread = openai.threads.get(bridgeSession.codexThreadId);
+    assert.ok(thread);
+    const turnId = `${bridgeSession.codexThreadId}-turn-timed-out`;
+    await onTurnStarted?.({ turnId, threadId: bridgeSession.codexThreadId });
+    thread.turns = [{
+      id: turnId,
+      status: 'running',
+      error: null,
+      items: [],
+    }];
+    return {
+      outputText: '',
+      outputState: 'partial',
+      previewText: 'partial answer',
+      finalSource: 'progress_only',
+      status: 'timed_out',
+      turnId,
+      threadId: bridgeSession.codexThreadId,
+      title: bridgeSession.title,
+    };
+  };
+
+  const result = await runtime.services.bridgeCoordinator.handleInboundEvent({
+    ...scopeRef,
+    text: 'partial after timeout',
+  });
+
+  assert.equal(result.meta?.codexTurn?.outputState, 'partial');
+  assert.equal(runtime.services.activeTurns.resolveScopeTurn(scopeRef), null);
+});
+
 test('conversation turns remain blocked when the previous provider turn is still running', async () => {
   const { runtime, openai } = makeRuntime();
   const scopeRef = {

@@ -20738,7 +20738,7 @@ function shouldRecoverFromProviderTurnResult(result) {
 
 function isTurnResultLocallyFinished(result) {
   const outputState = String(result?.outputState ?? 'complete').trim().toLowerCase();
-  return outputState !== 'partial';
+  return outputState !== 'partial' || result?.status === 'timed_out';
 }
 
 function isInterruptRequestTimeoutError(errorMessage) {

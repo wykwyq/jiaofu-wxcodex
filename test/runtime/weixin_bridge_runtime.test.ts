@@ -40,6 +40,7 @@ interface RuntimeHarnessOptions {
   typingKeepaliveMs?: number;
   processingNoticeDelayMs?: number;
   inboundAttachmentMergeWindowMs?: number;
+  inboundTextMergeWindowMs?: number;
   automationPollMs?: number;
   internalThreadCleanupMs?: number;
   pollEvents?: any[];
@@ -59,6 +60,7 @@ function makeRuntime({
   typingKeepaliveMs = 8000,
   processingNoticeDelayMs = 0,
   inboundAttachmentMergeWindowMs = 3000,
+  inboundTextMergeWindowMs = 0,
   automationPollMs = 30_000,
   internalThreadCleanupMs = 0,
   pollEvents = null,
@@ -114,6 +116,7 @@ function makeRuntime({
     typingKeepaliveMs,
     processingNoticeDelayMs,
     inboundAttachmentMergeWindowMs,
+    inboundTextMergeWindowMs,
     automationPollMs,
     internalThreadCleanupMs,
   });
@@ -542,6 +545,65 @@ test('WeixinBridgeRuntime dispatches plain-text turns in the background so slash
   assert.deepEqual(sent, [
     { externalScopeId: 'wxid_1', content: 'stop requested' },
     { externalScopeId: 'wxid_1', content: 'final answer' },
+  ]);
+});
+
+test('WeixinBridgeRuntime runs /stop immediately while a follow-up text is waiting in the merge window', async () => {
+  const sent: Array<{ externalScopeId: string; content: string }> = [];
+  let releaseTurn: (value?: unknown) => void = () => {};
+  const turnGate = new Promise((resolve) => {
+    releaseTurn = resolve;
+  });
+  const runtime = makeRuntime({
+    inboundTextMergeWindowMs: 5,
+    sendText: async ({ externalScopeId, content }) => {
+      sent.push({ externalScopeId, content });
+    },
+    coordinator: {
+      async handleInboundEvent(event: any) {
+        if (event.text === 'hello') {
+          await turnGate;
+          return completeResponse('first answer');
+        }
+        if (event.text === '/stop') {
+          return completeResponse('stop requested');
+        }
+        return completeResponse('follow-up answer');
+      },
+    },
+  });
+
+  const first = runtime.dispatchInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wxid_1',
+    text: 'hello',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const followUp = runtime.dispatchInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wxid_1',
+    text: 'follow-up',
+  });
+  const stop = runtime.dispatchInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wxid_1',
+    text: '/stop',
+  });
+  const stopFinishedImmediately = await Promise.race([
+    stop.then(() => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 20)),
+  ]);
+
+  releaseTurn();
+  await Promise.all([first, followUp, stop]);
+  await runtime.waitForIdle();
+
+  assert.equal(stopFinishedImmediately, true);
+  assert.equal(sent[0]?.content, 'stop requested');
+  assert.deepEqual(sent.map(({ content }) => content).sort(), [
+    'first answer',
+    'follow-up answer',
+    'stop requested',
   ]);
 });
 
@@ -1973,6 +2035,38 @@ test('WeixinBridgeRuntime forwards provider error details to Weixin', async () =
   ]);
 });
 
+test('WeixinBridgeRuntime localizes Codex cybersecurity risk flags without exposing the raw provider link', async () => {
+  const sent: Array<{ externalScopeId: string; content: string }> = [];
+  const runtime = makeRuntime({
+    sendText: async ({ externalScopeId, content }) => {
+      sent.push({ externalScopeId, content });
+    },
+    coordinator: {
+      async handleInboundEvent() {
+        return {
+          type: 'message',
+          messages: [{ text: '' }],
+          meta: {
+            codexTurn: {
+              outputState: 'provider_error',
+              previewText: '',
+              finalSource: 'session_runtime_error',
+              errorMessage: 'This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber',
+            },
+          },
+        };
+      },
+    },
+  });
+
+  await runtime.runOnce();
+
+  assert.deepEqual(sent, [{
+    externalScopeId: 'wxid_1',
+    content: 'Codex 风险检测拦截了本轮请求。本轮已结束；请注明目标是本地样本或测试环境，并使用 TARGET、HOST、TOKEN 等占位符后重试。',
+  }]);
+});
+
 test('WeixinBridgeRuntime rewrites exhausted Codex credits into a specific user-facing message', async () => {
   const sent: Array<{ externalScopeId: string; content: string }> = [];
   const runtime = makeRuntime({
@@ -2009,7 +2103,7 @@ test('WeixinBridgeRuntime rewrites exhausted Codex credits into a specific user-
 
 
 
-test('WeixinBridgeRuntime replies immediately when a second plain-text message arrives during an active scope turn', async () => {
+test('WeixinBridgeRuntime queues a second plain-text message instead of discarding it while the scope is busy', async () => {
   const sent: Array<{ externalScopeId: string; content: string }> = [];
   const started: string[] = [];
   let releaseFirst: (value?: unknown) => void = () => {};
@@ -2047,26 +2141,99 @@ test('WeixinBridgeRuntime replies immediately when a second plain-text message a
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   assert.deepEqual(started, ['first']);
-  await second;
-  assert.deepEqual(started, ['first']);
-  assert.deepEqual(sent, [
-    {
-      externalScopeId: 'wxid_1',
-      content: '当前已有一轮回复在进行中。\n请先等待，或使用 /stop 中断。',
-    },
-  ]);
+  assert.deepEqual(sent, []);
 
   releaseFirst();
-  await first;
+  await Promise.all([first, second]);
+
+  assert.deepEqual(started, ['first', 'second']);
+  assert.deepEqual(sent, [
+    { externalScopeId: 'wxid_1', content: 'first answer' },
+    { externalScopeId: 'wxid_1', content: 'second answer' },
+  ]);
+});
+
+test('WeixinBridgeRuntime merges two plain-text messages that arrive together into one Codex turn', async () => {
+  const seen: string[] = [];
+  const sent: Array<{ externalScopeId: string; content: string }> = [];
+  const runtime = makeRuntime({
+    inboundTextMergeWindowMs: 5,
+    pollEvents: [
+      {
+        platform: 'weixin',
+        externalScopeId: 'wxid_1',
+        text: 'first',
+      },
+      {
+        platform: 'weixin',
+        externalScopeId: 'wxid_1',
+        text: 'second',
+      },
+    ],
+    sendText: async ({ externalScopeId, content }) => {
+      sent.push({ externalScopeId, content });
+    },
+    coordinator: {
+      async handleInboundEvent(event: any) {
+        seen.push(event.text);
+        return completeResponse('merged answer');
+      },
+    },
+  });
+
+  await runtime.runOnce();
+
+  assert.deepEqual(seen, ['first\n\nsecond']);
+  assert.deepEqual(sent, [
+    { externalScopeId: 'wxid_1', content: 'merged answer' },
+  ]);
+});
+
+test('WeixinBridgeRuntime keeps merging follow-up text while the current scope turn is active', async () => {
+  const started: string[] = [];
+  let releaseFirst: (value?: unknown) => void = () => {};
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const runtime = makeRuntime({
+    inboundTextMergeWindowMs: 5,
+    sendText: async () => {},
+    coordinator: {
+      async handleInboundEvent(event: any) {
+        started.push(event.text);
+        if (event.text === 'first') {
+          await firstGate;
+        }
+        return completeResponse(`${event.text} answer`);
+      },
+    },
+  });
+
+  const first = runtime.handleInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wxid_1',
+    text: 'first',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const second = runtime.handleInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wxid_1',
+    text: 'second',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const third = runtime.handleInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wxid_1',
+    text: 'third',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
 
   assert.deepEqual(started, ['first']);
-  assert.deepEqual(sent, [
-    {
-      externalScopeId: 'wxid_1',
-      content: '当前已有一轮回复在进行中。\n请先等待，或使用 /stop 中断。',
-    },
-    { externalScopeId: 'wxid_1', content: 'first answer' },
-  ]);
+
+  releaseFirst();
+  await Promise.all([first, second, third]);
+
+  assert.deepEqual(started, ['first', 'second\n\nthird']);
 });
 
 test('WeixinBridgeRuntime throws when provider marks the final complete but returns no final text', async () => {

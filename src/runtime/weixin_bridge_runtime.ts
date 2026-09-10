@@ -148,6 +148,7 @@ interface WeixinBridgeRuntimeOptions {
   typingKeepaliveMs?: number;
   processingNoticeDelayMs?: number;
   inboundAttachmentMergeWindowMs?: number;
+  inboundTextMergeWindowMs?: number;
   automationPollMs?: number;
   internalThreadCleanupMs?: number;
   locale?: string | null;
@@ -181,6 +182,8 @@ export class WeixinBridgeRuntime {
   processingNoticeDelayMs: number;
 
   inboundAttachmentMergeWindowMs: number;
+
+  inboundTextMergeWindowMs: number;
 
   automationPollMs: number;
 
@@ -225,6 +228,7 @@ export class WeixinBridgeRuntime {
     typingKeepaliveMs = WeixinBridgeRuntime.DEFAULT_TYPING_KEEPALIVE_MS,
     processingNoticeDelayMs = 3_000,
     inboundAttachmentMergeWindowMs = 3000,
+    inboundTextMergeWindowMs = 1500,
     automationPollMs = 30_000,
     internalThreadCleanupMs = 24 * 60 * 60 * 1000,
     locale = null,
@@ -241,6 +245,7 @@ export class WeixinBridgeRuntime {
     this.typingKeepaliveMs = typingKeepaliveMs;
     this.processingNoticeDelayMs = processingNoticeDelayMs;
     this.inboundAttachmentMergeWindowMs = inboundAttachmentMergeWindowMs;
+    this.inboundTextMergeWindowMs = inboundTextMergeWindowMs;
     this.automationPollMs = automationPollMs;
     this.internalThreadCleanupMs = internalThreadCleanupMs;
     this.i18n = createI18n(locale);
@@ -320,7 +325,11 @@ export class WeixinBridgeRuntime {
     }
     const command = parseSlashCommand(String(event?.text ?? ''));
     if (command) {
-      await this.flushPendingInboundMerge(event.externalScopeId);
+      if (String(command.name ?? '').trim().toLowerCase() === 'stop') {
+        void this.flushPendingInboundMerge(event.externalScopeId);
+      } else {
+        await this.flushPendingInboundMerge(event.externalScopeId);
+      }
       if (shouldScheduleSlashCommand(command)) {
         const task = this.processInboundEventWithOptions(event, { deferPostResponseAction: true }).catch(async (error) => {
           await this.onError(error);
@@ -396,14 +405,15 @@ export class WeixinBridgeRuntime {
         return this.enqueueScopeWork(scopeId, async () => this.processInboundEvent(event));
       }
       const mergedEvent = mergeInboundEvents(pending.event, event);
-      if (shouldDelayInboundEvent(mergedEvent)) {
+      const mergeWindowMs = this.inboundMergeWindowMs(mergedEvent);
+      if (mergeWindowMs > 0) {
         pending.event = mergedEvent;
         debugRuntime('pending_inbound_merge_updated', {
           scopeId,
           attachmentCount: Array.isArray(mergedEvent.attachments) ? mergedEvent.attachments.length : 0,
           hasText: Boolean(String(mergedEvent.text ?? '').trim()),
         });
-        this.armPendingInboundMerge(scopeId, pending);
+        this.armPendingInboundMerge(scopeId, pending, mergeWindowMs);
         return pending.completion;
       }
       this.pendingInboundMerges.delete(scopeId);
@@ -413,61 +423,70 @@ export class WeixinBridgeRuntime {
       return operation;
     }
 
-    if (this.scopeChains.has(scopeId)) {
-      debugRuntime('scope_busy_rejected', {
-        scopeId,
-        textPreview: truncateDebugText(event?.text),
-        attachmentCount: Array.isArray(event?.attachments) ? event.attachments.length : 0,
-      });
-      return this.respondWhileScopeBusy(event);
-    }
-
-    if (shouldDelayInboundEvent(event)) {
+    const mergeWindowMs = this.inboundMergeWindowMs(event);
+    if (mergeWindowMs > 0) {
       const deferred = createPendingInboundMerge(event);
       this.pendingInboundMerges.set(scopeId, deferred);
       debugRuntime('pending_inbound_merge_started', {
         scopeId,
         attachmentCount: Array.isArray(event.attachments) ? event.attachments.length : 0,
       });
-      this.armPendingInboundMerge(scopeId, deferred);
+      this.armPendingInboundMerge(scopeId, deferred, mergeWindowMs);
       return deferred.completion;
+    }
+
+    if (this.scopeChains.has(scopeId)) {
+      debugRuntime('scope_busy_queued', {
+        scopeId,
+        textPreview: truncateDebugText(event?.text),
+        attachmentCount: Array.isArray(event?.attachments) ? event.attachments.length : 0,
+      });
     }
 
     return this.enqueueScopeWork(scopeId, async () => this.processInboundEvent(event));
   }
 
-  async respondWhileScopeBusy(event: InboundTextEvent): Promise<RuntimeResponse> {
-    const content = [
-      this.i18n.t('coordinator.blocked.active'),
-      this.i18n.t('coordinator.blocked.waitOrStop'),
-    ].join('\n');
-    const typingStart = this.safeSendTyping(event.externalScopeId, 'start');
-    try {
-      const delivery = await this.sendTextWithRetry({
-        externalScopeId: event.externalScopeId,
-        content,
-      });
-      if (!delivery.success && this.isRateLimitedDeliveryFailure(delivery)) {
-        await this.ensureScopeNoticeDelivered(
-          event.externalScopeId,
-          this.i18n.t('runtime.error.weixinRateLimitedNotice'),
-        );
-      }
-      return {
-        type: 'message',
-        messages: [{ text: content }],
-      };
-    } finally {
-      await typingStart;
-      await this.safeSendTyping(event.externalScopeId, 'stop');
+  inboundMergeWindowMs(event: InboundTextEvent): number {
+    if (parseSlashCommand(String(event?.text ?? '')) || isLocalKeepalivePulse(event)) {
+      return 0;
     }
+    const hasText = Boolean(String(event?.text ?? '').trim());
+    if (hasText && !hasAttachments(event)) {
+      return this.inboundTextMergeWindowMs;
+    }
+    if (!hasText && hasAttachments(event)) {
+      return this.inboundAttachmentMergeWindowMs;
+    }
+    return 0;
   }
 
-  armPendingInboundMerge(scopeId: string, pending: PendingInboundMerge): void {
+  armPendingInboundMerge(scopeId: string, pending: PendingInboundMerge, mergeWindowMs: number): void {
     this.clearPendingInboundTimer(pending);
+    const activeScopeChain = this.scopeChains.get(scopeId) ?? null;
+    if (activeScopeChain) {
+      debugRuntime('pending_inbound_merge_waiting_for_scope', {
+        scopeId,
+        attachmentCount: Array.isArray(pending.event.attachments) ? pending.event.attachments.length : 0,
+        hasText: Boolean(String(pending.event.text ?? '').trim()),
+      });
+      const resumePendingMerge = () => {
+        setTimeout(() => {
+          if (this.pendingInboundMerges.get(scopeId) !== pending) {
+            return;
+          }
+          if (this.scopeChains.has(scopeId)) {
+            this.armPendingInboundMerge(scopeId, pending, mergeWindowMs);
+            return;
+          }
+          void this.flushPendingInboundMerge(scopeId);
+        }, 0);
+      };
+      void activeScopeChain.then(resumePendingMerge, resumePendingMerge);
+      return;
+    }
     pending.timer = setTimeout(() => {
       void this.flushPendingInboundMerge(scopeId);
-    }, this.inboundAttachmentMergeWindowMs);
+    }, mergeWindowMs);
   }
 
   clearPendingInboundTimer(pending: PendingInboundMerge): void {
@@ -1028,6 +1047,9 @@ export class WeixinBridgeRuntime {
       return this.i18n.t('runtime.error.codexUsageLimitReached', {
         detail,
       });
+    }
+    if (/flagged for possible cybersecurity risk|trusted access for cyber|cyber_policy/i.test(normalized)) {
+      return this.i18n.t('runtime.error.codexCyberRiskFlagged');
     }
     return this.i18n.t('runtime.error.codex', { error: normalized });
   }
@@ -2210,13 +2232,6 @@ function shouldScheduleSlashCommand(command: { name?: string | null; args?: stri
   }
   const args = Array.isArray(command?.args) ? command.args : [];
   return !args.some((arg) => ['-h', '--help', '-help', '-helps'].includes(String(arg ?? '').trim().toLowerCase()));
-}
-
-function shouldDelayInboundEvent(event: InboundTextEvent): boolean {
-  return !parseSlashCommand(String(event?.text ?? ''))
-    && !isLocalKeepalivePulse(event)
-    && hasAttachments(event)
-    && !String(event?.text ?? '').trim();
 }
 
 function isLocalKeepalivePulse(event: InboundTextEvent | null | undefined): boolean {

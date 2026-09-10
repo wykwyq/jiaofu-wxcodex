@@ -135,6 +135,25 @@ test('CodexAppClient persists normal threads in extended history', async () => {
 
   assert.equal(seenParams.ephemeral, null);
   assert.equal(seenParams.persistExtendedHistory, true);
+  assert.match(seenParams.baseInstructions, /helpful assistant operating through a local chat bridge/i);
+});
+
+test('CodexAppClient resumes threads with isolated bridge base instructions', async () => {
+  const client = new CodexAppClient({
+    codexCliBin: 'codex',
+  });
+  let seenParams: any = null;
+
+  client.request = async (method, params) => {
+    assert.equal(method, 'thread/resume');
+    seenParams = params;
+    return {};
+  };
+
+  await client.resumeThread({ threadId: 'thread-1' });
+
+  assert.equal(seenParams.threadId, 'thread-1');
+  assert.match(seenParams.baseInstructions, /helpful assistant operating through a local chat bridge/i);
 });
 
 test('CodexAppClient normalizes second-based thread timestamps to milliseconds', async () => {
@@ -3332,13 +3351,14 @@ test('CodexAppClient waits for task_complete before returning missing for termin
   assert.ok(readCount >= 2);
 });
 
-test('CodexAppClient does not treat inProgress turns as terminal task_complete waits', async () => {
+test('CodexAppClient interrupts inProgress turns when returning partial output at the timeout', async () => {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-session-log-inprogress-'));
   const sessionPath = path.join(sessionDir, 'rollout.jsonl');
   fs.writeFileSync(sessionPath, '', 'utf8');
 
   let nowMs = 0;
   let commentarySent = false;
+  let interruptCalls = 0;
   const debugEntries: string[] = [];
   const client = new CodexAppClient({
     codexCliBin: 'codex',
@@ -3353,7 +3373,7 @@ test('CodexAppClient does not treat inProgress turns as terminal task_complete w
     },
   });
 
-  client.request = async (method) => {
+  client.request = async (method, params) => {
     if (method === 'turn/start') {
       return { turn: { id: 'turn-1' } };
     }
@@ -3391,6 +3411,11 @@ test('CodexAppClient does not treat inProgress turns as terminal task_complete w
         },
       };
     }
+    if (method === 'turn/interrupt') {
+      interruptCalls += 1;
+      assert.deepEqual(params, { threadId: 'thread-1', turnId: 'turn-1' });
+      return {};
+    }
     throw new Error(`Unexpected method: ${method}`);
   };
 
@@ -3405,8 +3430,10 @@ test('CodexAppClient does not treat inProgress turns as terminal task_complete w
 
   assert.equal(result.outputText, '');
   assert.equal(result.outputState, 'partial');
+  assert.equal(result.status, 'timed_out');
   assert.equal(result.previewText, 'still working');
   assert.equal(result.finalSource, 'commentary_only');
+  assert.equal(interruptCalls, 1);
   assert.equal(debugEntries.some((entry) => entry.includes('turn_terminal_state')), false);
   assert.equal(debugEntries.some((entry) => entry.includes('waiting_for_session_task_complete')), false);
 });
@@ -3545,6 +3572,148 @@ test('CodexAppClient surfaces exhausted subscription credits from session rate l
   assert.equal(result.outputState, 'provider_error');
   assert.equal(result.finalSource, 'session_runtime_error');
   assert.equal(result.errorMessage, 'Codex subscription credits are exhausted (premium balance 0).');
+});
+
+test('CodexAppClient keeps a completed answer when session metadata reports no optional credits', async () => {
+  const client = new CodexAppClient({
+    codexCliBin: 'codex',
+  });
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-session-log-answer-without-credits-'));
+  const sessionPath = path.join(sessionDir, 'rollout.jsonl');
+  fs.writeFileSync(sessionPath, [
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: 'turn_context',
+      payload: {
+        turn_id: 'turn-1',
+      },
+    }),
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        rate_limits: {
+          limit_id: 'codex_bengalfox',
+          credits: {
+            has_credits: false,
+            unlimited: false,
+            balance: '0',
+          },
+          primary: { used_percent: 0 },
+          secondary: { used_percent: 0 },
+          rate_limit_reached_type: null,
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'turn-1',
+        last_agent_message: '你好！有什么我可以帮你处理的吗？',
+      },
+    }),
+  ].join('\n') + '\n', 'utf8');
+
+  client.request = async (method) => {
+    if (method === 'turn/start') {
+      return { turn: { id: 'turn-1' } };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: 'thread-1',
+          name: 'Thread 1',
+          path: sessionPath,
+          turns: [{
+            id: 'turn-1',
+            status: 'inProgress',
+            items: [{ type: 'userMessage', text: '你好' }],
+          }],
+        },
+      };
+    }
+    return {};
+  };
+
+  const result = await client.startTurn({
+    threadId: 'thread-1',
+    inputText: '你好',
+    model: 'gpt-5.5',
+    effort: null,
+    collaborationMode: 'default',
+    timeoutMs: 2500,
+  });
+
+  assert.equal(result.outputText, '你好！有什么我可以帮你处理的吗？');
+  assert.equal(result.outputState, 'complete');
+  assert.equal(result.errorMessage ?? null, null);
+});
+
+test('CodexAppClient surfaces errors embedded in task_complete without waiting for the turn timeout', async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-session-log-task-complete-error-'));
+  const sessionPath = path.join(sessionDir, 'rollout.jsonl');
+  fs.writeFileSync(sessionPath, `${JSON.stringify({
+    timestamp: new Date().toISOString(),
+    type: 'event_msg',
+    payload: {
+      type: 'task_complete',
+      turn_id: 'turn-1',
+      last_agent_message: null,
+      error: {
+        message: 'This content was flagged for possible cybersecurity risk.',
+        codex_error_info: 'cyber_policy',
+      },
+    },
+  })}\n`, 'utf8');
+
+  let nowMs = 0;
+  let readCount = 0;
+  const client = new CodexAppClient({
+    codexCliBin: 'codex',
+    turnPollNow: () => nowMs,
+    turnPollSleep: async (ms) => {
+      nowMs += ms;
+    },
+  });
+  client.request = async (method) => {
+    if (method === 'turn/start') {
+      return { turn: { id: 'turn-1' } };
+    }
+    if (method === 'thread/read') {
+      readCount += 1;
+      return {
+        thread: {
+          id: 'thread-1',
+          name: 'Thread 1',
+          path: sessionPath,
+          turns: [{
+            id: 'turn-1',
+            status: 'completed',
+            items: [{ type: 'userMessage', text: 'hello' }],
+          }],
+        },
+      };
+    }
+    return {};
+  };
+
+  const result = await client.startTurn({
+    threadId: 'thread-1',
+    inputText: 'hello',
+    model: 'gpt-5.4',
+    effort: null,
+    collaborationMode: 'default',
+    timeoutMs: 12000,
+  });
+
+  assert.equal(result.outputText, '');
+  assert.equal(result.outputState, 'provider_error');
+  assert.equal(result.finalSource, 'session_runtime_error');
+  assert.equal(result.errorMessage, 'This content was flagged for possible cybersecurity risk.');
+  assert.equal(readCount, 1);
 });
 
 test('CodexAppClient returns provider_error immediately when an error notification arrives for the active stdio turn', async () => {

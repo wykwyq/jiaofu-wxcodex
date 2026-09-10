@@ -37,6 +37,10 @@ import type {
 const APP_SERVER_CONNECT_TIMEOUT_MS = 20_000;
 const DEFAULT_TURN_TIMEOUT_MS = 5 * 60 * 1000;
 const MEDIA_GENERATION_TURN_TIMEOUT_MS = 10 * 60 * 1000;
+const CODEXBRIDGE_BASE_INSTRUCTIONS = [
+  'You are Codex, a helpful assistant operating through a local chat bridge.',
+  'Follow the active system and safety policies, use the configured local workspace when relevant, and answer directly in the user\'s language.',
+].join(' ');
 
 interface CodexAppLogger {
   debug?: (message: string) => void;
@@ -551,7 +555,7 @@ export class CodexAppClient extends EventEmitter {
       modelProvider: null,
       serviceTier,
       serviceName: null,
-      baseInstructions: null,
+      baseInstructions: CODEXBRIDGE_BASE_INSTRUCTIONS,
       developerInstructions: null,
       personality: null,
       ephemeral,
@@ -580,7 +584,7 @@ export class CodexAppClient extends EventEmitter {
       threadId,
       cwd: null,
       approvalPolicy: null,
-      baseInstructions: null,
+      baseInstructions: CODEXBRIDGE_BASE_INSTRUCTIONS,
       developerInstructions: null,
       config: null,
       sandbox: null,
@@ -1946,6 +1950,23 @@ export class CodexAppClient extends EventEmitter {
         }
         if (!turn || !isTurnTerminal(turn.status)) {
           const sessionState = inspectTurnCompletionFromSessionPath(sessionPath, turnId);
+          if (sessionState.hasTaskComplete && sessionState.runtimeError) {
+            const result = {
+              turnId,
+              threadId,
+              title: thread?.title ?? null,
+              outputText: '',
+              outputArtifacts: [],
+              outputMedia: [],
+              outputState: 'provider_error',
+              previewText: progressState.finalAnswerText,
+              finalSource: 'session_runtime_error',
+              status: turn?.status ?? null,
+              errorMessage: sessionState.runtimeError,
+            };
+            this.logDebug('turn_wait_return', summarizeTurnResultForDebug(result));
+            return result;
+          }
           if (sessionState.hasTaskComplete && (sessionState.lastAgentMessage || sessionState.outputArtifacts.length > 0)) {
             this.noteApprovedExecutionSignal({
               threadId,
@@ -1984,6 +2005,9 @@ export class CodexAppClient extends EventEmitter {
             continue;
           }
           if (previewText) {
+            if (!sawTerminalNotification) {
+              await this.interruptTimedOutTurn({ threadId, turnId });
+            }
             const result = {
               turnId,
               threadId,
@@ -1994,7 +2018,7 @@ export class CodexAppClient extends EventEmitter {
               outputState: sawTerminalNotification ? 'complete' : 'partial',
               previewText: progressState.finalAnswerText,
               finalSource: progressState.finalAnswerText ? 'progress_only' : 'commentary_only',
-              status: sawTerminalNotification ? 'completed' : null,
+              status: sawTerminalNotification ? 'completed' : 'timed_out',
             };
             this.logDebug('turn_wait_return', summarizeTurnResultForDebug(result));
             return result;
@@ -2154,7 +2178,10 @@ export class CodexAppClient extends EventEmitter {
             sessionState,
             hasAssistantVisibleItems,
           );
-          if (shouldWaitForSettledOutputAfterTerminalTurn(turn, progressState) || sessionTaskCompleteNeedsMaterializationWait) {
+          if (
+            !sessionState.runtimeError
+            && (shouldWaitForSettledOutputAfterTerminalTurn(turn, progressState) || sessionTaskCompleteNeedsMaterializationWait)
+          ) {
             const snapshotKey = buildTurnSnapshotKey(turn);
             if (snapshotKey === lastTurnSnapshotKey) {
               stableTerminalReadCount += 1;
@@ -2211,14 +2238,14 @@ export class CodexAppClient extends EventEmitter {
               markCompleted: true,
             });
             const previewText = resolveTurnPreviewText(turn, progressState);
-            if (!previewText && sessionState.runtimeError) {
+            if (sessionState.runtimeError) {
               const result = {
                 turnId,
                 threadId,
                 title: thread?.title ?? null,
                 outputText: '',
                 outputState: 'provider_error',
-                previewText: '',
+                previewText,
                 finalSource: 'session_runtime_error',
                 status: turn.status,
                 errorMessage: sessionState.runtimeError,
@@ -2337,6 +2364,7 @@ export class CodexAppClient extends EventEmitter {
       }
       const previewText = progressState.finalAnswerText || progressState.commentaryText;
       if (previewText) {
+        await this.interruptTimedOutTurn({ threadId, turnId });
         const result = {
           turnId,
           threadId,
@@ -2345,7 +2373,7 @@ export class CodexAppClient extends EventEmitter {
           outputState: 'partial',
           previewText,
           finalSource: progressState.finalAnswerText ? 'progress_only' : 'commentary_only',
-          status: null,
+          status: 'timed_out',
         };
         this.logDebug('turn_wait_return', summarizeTurnResultForDebug(result));
         return result;
@@ -4004,7 +4032,11 @@ function inspectTurnCompletionFromSessionPath(sessionPath, turnId) {
       }
       const lastAgentMessage = extractTextCandidate(payload.last_agent_message)?.trim() || null;
       const toolSuggestionMessage = findSessionToolSuggestionMessageForTurn(lines, index, turnId);
-      const runtimeError = findSessionRuntimeErrorForTurn(lines, index, turnId);
+      const explicitRuntimeError = extractTextCandidate(payload.error)?.trim() || null;
+      const runtimeError = explicitRuntimeError
+        || (!lastAgentMessage && !toolSuggestionMessage
+          ? findSessionRuntimeErrorForTurn(lines, index, turnId)
+          : null);
       return inspectSessionTurnArtifacts(lines, index, {
         hasTaskComplete: true,
         lastAgentMessage,
@@ -4267,6 +4299,7 @@ function shouldWaitForSessionTaskMaterialization(sessionState, hasAssistantVisib
   return sessionState.hasTaskComplete
     && !hasAssistantVisibleItems
     && !sessionState.lastAgentMessage
+    && !sessionState.runtimeError
     && sessionState.outputArtifacts.length === 0;
 }
 
